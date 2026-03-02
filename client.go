@@ -32,8 +32,9 @@ var _ Caller = (*Client)(nil)
 //
 // Client 是并发安全的，应当被复用而非每次请求创建新实例。
 type Client struct {
-	config *Config
-	closed atomic.Bool
+	config  *Config
+	breaker *CircuitBreaker // 熔断器，nil 表示禁用
+	closed  atomic.Bool
 }
 
 // NewClient 创建新的易仓ERP客户端
@@ -61,11 +62,19 @@ func NewClient(appKey, appSecret, serviceID string, opts ...Option) (*Client, er
 		opt(cfg)
 	}
 
+	// 确保 Metrics 不为 nil（防止用户显式传入 nil）
+	if cfg.Metrics == nil {
+		cfg.Metrics = NoopMetrics{}
+	}
+
 	if cfg.HTTPClient == nil {
 		transport := &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConns:          100,
+			MaxIdleConnsPerHost:   50,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 		}
 		cfg.HTTPClient = &http.Client{
 			Timeout:   cfg.Timeout,
@@ -73,7 +82,10 @@ func NewClient(appKey, appSecret, serviceID string, opts ...Option) (*Client, er
 		}
 	}
 
-	return &Client{config: cfg}, nil
+	// 初始化熔断器（BreakerConfig.Threshold==0 时返回 nil 即禁用）
+	cb := newCircuitBreaker(cfg.Breaker, cfg.Metrics.RecordCircuitBreaker)
+
+	return &Client{config: cfg, breaker: cb}, nil
 }
 
 // MustNewClient 创建客户端，失败时 panic。适用于初始化阶段。
@@ -93,17 +105,36 @@ func MustNewClient(appKey, appSecret, serviceID string, opts ...Option) *Client 
 //   - bizContent: 业务参数，会被序列化为 JSON（传 nil 为空对象）
 //   - result:     响应 data 字段的目标结构体指针（传 nil 忽略返回数据）
 func (c *Client) Do(ctx context.Context, method string, bizContent interface{}, result interface{}) error {
-	resp, err := c.doRequest(ctx, method, bizContent)
-	if err != nil {
-		return err
+	// 熔断器检查：Open 状态直接拒绝，不进入重试
+	if c.breaker != nil && !c.breaker.Allow() {
+		c.config.Metrics.RecordRequest(method, 0, 0, ErrCircuitOpen)
+		return ErrCircuitOpen
 	}
 
-	// 检查业务错误
-	if resp.Code != CodeSuccess {
-		return &APIError{
-			Code:    resp.Code,
-			Message: resp.Message,
+	var resp *Response
+	err := doWithRetry(ctx, c.config.Retry, c.config.Logger, c.config.Metrics, method, func() error {
+		v, e := c.doRequest(ctx, method, bizContent)
+		if e != nil {
+			return e
 		}
+		resp = v
+		if v.Code != CodeSuccess {
+			return &APIError{Code: v.Code, Message: v.Message}
+		}
+		return nil
+	})
+
+	// 更新熔断器状态
+	if c.breaker != nil {
+		if err != nil {
+			c.breaker.RecordFailure()
+		} else {
+			c.breaker.RecordSuccess()
+		}
+	}
+
+	if err != nil {
+		return err
 	}
 
 	// 解析业务数据
@@ -112,26 +143,49 @@ func (c *Client) Do(ctx context.Context, method string, bizContent interface{}, 
 			return fmt.Errorf("ecerp: unmarshal data error: %w, raw: %s", err, truncateStr(string(resp.Data), 500))
 		}
 	}
-
 	return nil
 }
 
 // DoRaw 执行 API 调用，返回原始响应
 //
 // 即使 API 返回非 200 状态码，Response 仍会被返回以供调试。
+// DoRaw 同样应用重试和熔断器配置。
 func (c *Client) DoRaw(ctx context.Context, method string, bizContent interface{}) (*Response, error) {
-	resp, err := c.doRequest(ctx, method, bizContent)
-	if err != nil {
-		return nil, err
+	// 熔断器检查
+	if c.breaker != nil && !c.breaker.Allow() {
+		c.config.Metrics.RecordRequest(method, 0, 0, ErrCircuitOpen)
+		return nil, ErrCircuitOpen
 	}
 
-	if resp.Code != CodeSuccess {
-		return resp, &APIError{
-			Code:    resp.Code,
-			Message: resp.Message,
+	var resp *Response
+	err := doWithRetry(ctx, c.config.Retry, c.config.Logger, c.config.Metrics, method, func() error {
+		v, e := c.doRequest(ctx, method, bizContent)
+		if e != nil {
+			return e
+		}
+		resp = v
+		if v.Code != CodeSuccess {
+			return &APIError{Code: v.Code, Message: v.Message}
+		}
+		return nil
+	})
+
+	// 更新熔断器状态
+	if c.breaker != nil {
+		if err != nil {
+			c.breaker.RecordFailure()
+		} else {
+			c.breaker.RecordSuccess()
 		}
 	}
 
+	if err != nil {
+		// DoRaw 即使有业务错误也返回 resp，方便调试
+		if resp != nil {
+			return resp, err
+		}
+		return nil, err
+	}
 	return resp, nil
 }
 
@@ -198,9 +252,9 @@ func (c *Client) doRequest(ctx context.Context, method string, bizContent interf
 		return nil, fmt.Errorf("ecerp: marshal request error: %w", err)
 	}
 
-	// 调试日志
+	// 调试日志 (R5: 使用 Info 级别记录请求，而非 Debug)
 	if c.config.Logger != nil {
-		c.config.Logger.Debug("ecerp: request",
+		c.config.Logger.Info("ecerp: sending request",
 			slog.String("method", method),
 			slog.Int("body_size", len(bodyBytes)),
 		)
@@ -239,9 +293,9 @@ func (c *Client) doRequest(ctx context.Context, method string, bizContent interf
 		return nil, errors.New("ecerp: empty response body")
 	}
 
-	// 调试日志
+	// 调试日志 (R5: 使用 Info 级别记录响应)
 	if c.config.Logger != nil {
-		c.config.Logger.Debug("ecerp: response",
+		c.config.Logger.Info("ecerp: received response",
 			slog.String("method", method),
 			slog.Int("status", httpResp.StatusCode),
 			slog.Int("body_size", len(respBody)),

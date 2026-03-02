@@ -597,7 +597,10 @@ func (s *Service) GetOrderPackageList(ctx context.Context, orderCode string) ([]
 func (s *Service) GetOrderInfo(ctx context.Context, orderCode string) (*Order, error) {
 	var result Order
 	err := s.C.Do(ctx, "getOrderInfo", map[string]string{"order_code": orderCode}, &result)
-	return &result, err
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // CreateFbaOrder 创建转FBA订单

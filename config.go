@@ -8,7 +8,7 @@ import (
 
 const (
 	// DefaultBaseURL 易仓ERP开放平台默认API地址
-	DefaultBaseURL = "http://openapi-web.eccang.com/openApi/api/unity"
+	DefaultBaseURL = "https://openapi-web.eccang.com/openApi/api/unity"
 
 	// DefaultTimeout 默认超时时间
 	DefaultTimeout = 30 * time.Second
@@ -62,6 +62,19 @@ type Config struct {
 	// Logger 日志记录器。设为 nil 关闭日志。
 	// 使用 slog.Logger 以兼容 Go 标准库。
 	Logger *slog.Logger
+
+	// Retry 重试配置。
+	// 默认启用（MaxAttempts=3）。若要禁用重试，可使用 WithDisableRetry()。
+	Retry RetryConfig
+
+	// Breaker 熔断器配置。
+	// 默认启用（Threshold=5，Timeout=60s）。若要禁用熔断器，可使用 WithDisableBreaker()。
+	Breaker BreakerConfig
+
+	// Metrics 可观测性指标接口。
+	// 默认为 NoopMetrics（空实现，零开销）。
+	// 可使用 WithMetrics() 接入 Prometheus / OTEL 等。
+	Metrics Metrics
 }
 
 // Option 函数式选项
@@ -126,6 +139,41 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
+// WithRetry 自定义重试配置
+func WithRetry(retry RetryConfig) Option {
+	return func(c *Config) {
+		c.Retry = retry
+	}
+}
+
+// WithDisableRetry 禁用自动重试（每次请求最多尝试一次）
+func WithDisableRetry() Option {
+	return func(c *Config) {
+		c.Retry.MaxAttempts = 1
+	}
+}
+
+// WithBreaker 自定义熔断器配置
+func WithBreaker(cfg BreakerConfig) Option {
+	return func(c *Config) {
+		c.Breaker = cfg
+	}
+}
+
+// WithDisableBreaker 禁用熔断器
+func WithDisableBreaker() Option {
+	return func(c *Config) {
+		c.Breaker.Threshold = 0
+	}
+}
+
+// WithMetrics 设置可观测性指标接口
+func WithMetrics(m Metrics) Option {
+	return func(c *Config) {
+		c.Metrics = m
+	}
+}
+
 // newDefaultConfig 创建默认配置
 func newDefaultConfig(appKey, appSecret, serviceID string) *Config {
 	return &Config{
@@ -138,5 +186,8 @@ func newDefaultConfig(appKey, appSecret, serviceID string) *Config {
 		Version:   DefaultVersion,
 		SignType:  DefaultSignType,
 		UserAgent: DefaultUserAgent,
+		Retry:     defaultRetryConfig(),
+		Breaker:   defaultBreakerConfig(),
+		Metrics:   NoopMetrics{},
 	}
 }
